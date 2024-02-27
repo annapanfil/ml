@@ -5,14 +5,18 @@ import torch.optim as optim
 
 
 torch.manual_seed(1337)
-batch_size = 32 # how many independent sequences will we process in paralell
-block_size = 8 # max context_length
+device = "cuda" if torch.cuda.is_available() else "cpu"
+batch_size = 64 # how many independent sequences will we process in paralell
+block_size = 256 # max context_length
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
-device = "cuda" if torch.cuda.is_available() else "cpu"
+learning_rate = 3e-4 # for bigger models, lower learning rate is better
 eval_iters = 200
-n_embed = 32
+n_embed = 384 
+n_head = 4
+# 384 // 6 = 64
+n_layer = 6
+dropout = 0.2
 
 ################################################
 print("Running on", device)
@@ -54,8 +58,10 @@ class FeedForward(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, n_embed),
-            nn.ReLU()
+            nn.Linear(n_embed, 4 * n_embed), # 4 comes from the paper "Attention is all you need"
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed), # projection layer
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -69,6 +75,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size))) # not a parameter, but buffer
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x) # (B, T, H)
@@ -77,6 +85,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei) # prevent some nodes from communicating
         # weighted aggregation of values
         v = self.value(x)
         out = wei @ v
@@ -88,9 +97,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
 
 class Block(nn.Module):
@@ -103,25 +116,23 @@ class Block(nn.Module):
         
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed) # normalization before attention (not like in paper, but more common now)
+        self.ln2 = nn.LayerNorm(n_embed)
 
     def forward(self, x):
-        x = self.sa(x)
-        x = self.ffwd(x)
+        x = x + self.sa(self.ln1(x)) # residual connection to help learn big network
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 
-# BASELINE MODEL
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(
-            Block(n_embed, 4),
-            Block(n_embed, 4),
-            Block(n_embed, 4),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size) # language model
 
     def forward(self, idx, targets=None):
@@ -132,6 +143,7 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = token_emb + pos_emb # (B, T, C)
         x = self.blocks(x) # (B, T, C)
+        x = self.ln_f(x) # (B, T, C)
         logits = self.lm_head(x) #(B, T, vocab_size) – (batch, time, channel)
         
         if targets is None:
