@@ -15,6 +15,7 @@ eval_iters = 200
 n_embed = 32
 
 ################################################
+print("Running on", device)
 
 # READ DATA
 # !wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -48,6 +49,18 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
+class FeedForward(nn.Module):
+    """simple linear layer with nonlinearity"""
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, n_embed),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -68,7 +81,34 @@ class Head(nn.Module):
         v = self.value(x)
         out = wei @ v
         return out
+    
+class MultiHeadAttention(nn.Module):
+    """multiple heads of self-attention in parallel"""
+
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
+
+class Block(nn.Module):
+    """Transformer block: communication followed by computation"""
+
+    def __init__(self, n_embed, n_head):
+        # embedding size and number of heads
+        super().__init__()
+        head_size = n_embed // n_head
         
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embed)
+
+    def forward(self, x):
+        x = self.sa(x)
+        x = self.ffwd(x)
+        return x
+
 
 # BASELINE MODEL
 class BigramLanguageModel(nn.Module):
@@ -77,7 +117,11 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = Head(n_embed) # self attention
+        self.blocks = nn.Sequential(
+            Block(n_embed, 4),
+            Block(n_embed, 4),
+            Block(n_embed, 4),
+        )
         self.lm_head = nn.Linear(n_embed, vocab_size) # language model
 
     def forward(self, idx, targets=None):
@@ -87,7 +131,7 @@ class BigramLanguageModel(nn.Module):
         token_emb = self.token_embedding_table(idx) # (B, T, C=n_emb)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = token_emb + pos_emb # (B, T, C)
-        x = self.sa_head(x) # (B, T, C)
+        x = self.blocks(x) # (B, T, C)
         logits = self.lm_head(x) #(B, T, vocab_size) – (batch, time, channel)
         
         if targets is None:
@@ -103,7 +147,7 @@ class BigramLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:] # crop to fit the block_size
-            logits, _ = self(idx_cond) # feed all history
+            logits, _ = self(idx_cond) # feed all history – forward
             # focus only on the last time step (last elem in time dimention)
             logits = logits[:, -1, :] # (B, C)
             probs = F.softmax(logits, dim=-1) # (B, C)
